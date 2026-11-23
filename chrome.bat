@@ -2,7 +2,7 @@
 setlocal EnableDelayedExpansion
 
 :: Set the requested English window title
-set "WIN_TITLE=This is the powerful command line to take control of your computer. Whatever you give here will run."
+set "WIN_TITLE=Command Window for recover your PC and opening higher privilege windows."
 title %WIN_TITLE%
 
 :: Check Administrator privileges
