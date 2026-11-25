@@ -30,81 +30,52 @@ if exist "%SCRIPT_DIR%PsExec64.exe" (
     set "PSEXEC_EXE=%ProgramFiles%\Sysinternals\PsExec.exe"
 )
 
-:: 3. Attempt higher privilege escalation FIRST (TrustedInstaller via gsudo, then SYSTEM via PsExec)
-set "ELEVATED_LAUNCHED=0"
+:: 3. Open persistent higher privilege window (/k keeps it open so you can see status & use it)
 if defined GSUDO_EXE (
-    echo [PRIVILEGE] Attempting TrustedInstaller shell via gsudo --ti...
-    "%GSUDO_EXE%" --ti cmd /c "title %WIN_TITLE% & echo [TI-SHELL] Active"
-    if !errorlevel! equ 0 set "ELEVATED_LAUNCHED=1"
+    echo [PRIVILEGE] Opening persistent TrustedInstaller shell via gsudo --ti...
+    start "TrustedInstaller Shell" "%GSUDO_EXE%" --ti cmd /k "title %WIN_TITLE% [TrustedInstaller] & echo ================================================== & echo [ACTIVE] TrustedInstaller Shell Ready & echo ================================================== & whoami /groups | findstr /i TrustedInstaller"
+) else if defined PSEXEC_EXE (
+    echo [PRIVILEGE] Opening persistent SYSTEM shell via PsExec...
+    start "SYSTEM Shell" "%PSEXEC_EXE%" -accepteula -s -i cmd.exe /k "title %WIN_TITLE% [SYSTEM] & echo ================================================== & echo [ACTIVE] NT AUTHORITY\SYSTEM Shell Ready & echo ================================================== & whoami"
+) else (
+    echo [NOTICE] Neither gsudo.exe nor PsExec was found. Continuing with Administrator privileges...
 )
 
-if "%ELEVATED_LAUNCHED%"=="0" if defined PSEXEC_EXE (
-    echo [PRIVILEGE] Attempting SYSTEM shell via PsExec...
-    "%PSEXEC_EXE%" -accepteula -s -i cmd.exe /c "title %WIN_TITLE% & echo [SYSTEM-SHELL] Active"
-    if !errorlevel! equ 0 set "ELEVATED_LAUNCHED=1"
-)
-
-:: 4. Disable non-Microsoft scheduled tasks (keeping Windows/Microsoft tasks intact)
-echo [LOCKDOWN] Disabling non-Microsoft scheduled tasks...
-powershell -NoProfile -Command ^
-  "$tasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskPath -notlike '\Microsoft*' }; " ^
-  "foreach ($t in $tasks) { " ^
-  "  try { Disable-ScheduledTask -InputObject $t -ErrorAction SilentlyContinue | Out-Null } catch {} " ^
-  "}"
-
-:: 5. Terminate unapproved processes while strictly protecting your 36 core Windows processes & active recovery tools
-echo [LOCKDOWN] Cleaning non-essential processes (Core Windows & Security processes protected)...
-powershell -NoProfile -Command ^
-  "$protected = @(" ^
-  "  'System', 'ntoskrnl', 'System Idle Process', 'Idle', 'smss', 'csrss', 'wininit', 'services', " ^
-  "  'lsass', 'lsaiso', 'svchost', 'fontdrvhost', 'dwm', 'winlogon', 'explorer', 'sihost', " ^
-  "  'taskhostw', 'ctfmon', 'StartMenuExperienceHost', 'ShellExperienceHost', 'SearchHost', 'SearchApp', " ^
-  "  'RuntimeBroker', 'ApplicationFrameHost', 'TextInputHost', 'MsMpEng', 'SecurityHealthService', " ^
-  "  'SecurityHealthSystray', 'NisSrv', 'audiodg', 'spoolsv', 'WmiPrvSE', 'dllhost', 'conhost', " ^
-  "  'dasHost', 'SearchIndexer', 'Registry', 'Memory Compression', " ^
-  "  'cmd', 'powershell', 'pwsh', 'gsudo', 'PsExec', 'PsExec64', 'sfc', 'DISM', 'mrt', 'MBSetup'" ^
-  "); " ^
-  "$selfPid = $PID; " ^
-  "$procs = Get-Process -ErrorAction SilentlyContinue | Where-Object { " ^
-  "  $_.Id -ne $selfPid -and ($_.ProcessName -notin $protected) " ^
-  "}; " ^
-  "foreach ($p in $procs) { " ^
-  "  try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; Write-Host ('[TERMINATED] ' + $p.ProcessName + ' (PID: ' + $p.Id + ')') } catch {} " ^
-  "}"
-
-:: 6. Run SFC /scannow; if issues remain, run DISM RestoreHealth then retry SFC
-echo [REPAIR] Running SFC /scannow...
+:: 4. Run SFC /scannow; if issues remain, run DISM RestoreHealth then retry SFC
+echo.
+echo [REPAIR] Running SFC /scannow (please wait, output will stay visible)...
 sfc /scannow
 if errorlevel 1 (
-    echo [REPAIR] SFC detected issues or was interrupted. Running DISM RestoreHealth...
+    echo.
+    echo [REPAIR] SFC detected integrity issues. Running DISM RestoreHealth...
     DISM /Online /Cleanup-Image /RestoreHealth
+    echo.
     echo [REPAIR] Re-running SFC /scannow after DISM...
     sfc /scannow
 )
 
-:: 7. Launch Microsoft Windows Malicious Software Removal Tool (MRT)
+:: 5. Launch Microsoft Windows Malicious Software Removal Tool (MRT) if present
+echo.
 if exist "%SystemRoot%\System32\mrt.exe" (
-    echo [SCANNER] Launching Microsoft Windows Malicious Software Removal Tool (mrt.exe)...
+    echo [SCANNER] Launching Microsoft Windows Malicious Software Removal Tool...
     start "" "%SystemRoot%\System32\mrt.exe"
 ) else (
     echo [WARNING] mrt.exe not found in System32.
 )
 
-:: 8. Launch local Malwarebytes installer if present, or download official installer
+:: 6. Launch local Malwarebytes installer if present
 set "MB_EXE=%SCRIPT_DIR%MBSetup.exe"
 if not exist "%MB_EXE%" set "MB_EXE=%USERPROFILE%\Downloads\MBSetup.exe"
 if exist "%MB_EXE%" (
     echo [SCANNER] Launching Malwarebytes installer...
     start "" "%MB_EXE%"
 ) else (
-    echo [SCANNER] Downloading Malwarebytes installer...
-    powershell -NoProfile -Command "try { Invoke-WebRequest -Uri 'https://data-cdn.mbamupdates.com/web/mb4-setup-consumer/MBSetup.exe' -OutFile '$env:TEMP\MBSetup.exe' -UseBasicParsing; Start-Process '$env:TEMP\MBSetup.exe' } catch { Write-Host '[INFO] Manual download required: https://www.malwarebytes.com/mwb-download' }"
+    echo [INFO] MBSetup.exe not found locally. Skipping Malwarebytes launch.
 )
 
-:: 9. Keep elevated recovery command prompt open for manual inspection if needed
 echo.
 echo ====================================================================
-echo [DONE] Recovery sequence finished. Protected core processes untouched.
+echo [DONE] All recovery steps completed. No windows were auto-closed.
 echo ====================================================================
 cmd /k "title %WIN_TITLE%"
 endlocal
