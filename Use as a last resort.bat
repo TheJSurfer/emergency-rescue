@@ -1,38 +1,50 @@
 @echo off
 setlocal EnableDelayedExpansion
 
-:: Set the requested English window title
 set "WIN_TITLE=Command Window for recovering your PC and opening higher privilege windows."
 title %WIN_TITLE%
 
-:: Check Administrator privileges
+:: 1. Ensure Administrator privileges first
 net session >nul 2>&1
 if %errorlevel% neq 0 (
-    echo Requesting Administrator privileges...
+    echo [PRIVILEGE] Requesting Administrator elevation...
     powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
     exit /b
 )
 
-:: 1. Temporarily pause Windows Defender Real-Time Monitoring (may be blocked if Tamper Protection is ON)
-echo [DEFENDER] Attempting to pause Real-Time Monitoring...
-powershell -NoProfile -Command "try { Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction Stop; Write-Host 'Real-Time Monitoring paused.' } catch { Write-Host 'Could not change Defender setting (Tamper Protection or policy may block it).' }"
-
-:: 2. Refresh script directory and common tool paths first
+:: 2. Direct path detection without repeated 'where.exe' calls
 set "SCRIPT_DIR=%~dp0"
-if exist "%SCRIPT_DIR%" (
-    set "PATH=%SCRIPT_DIR%;%PATH%"
-)
-if exist "%ProgramFiles%\gsudo\Current\gsudo.exe" (
-    set "PATH=%ProgramFiles%\gsudo\Current;%PATH%"
-)
-if exist "%ProgramFiles%\Sysinternals\PsExec64.exe" (
-    set "PATH=%ProgramFiles%\Sysinternals;%PATH%"
-)
-if exist "%ProgramFiles%\Sysinternals\PsExec.exe" (
-    set "PATH=%ProgramFiles%\Sysinternals;%PATH%"
+set "GSUDO_EXE="
+set "PSEXEC_EXE="
+
+if exist "%SCRIPT_DIR%gsudo.exe" set "GSUDO_EXE=%SCRIPT_DIR%gsudo.exe"
+if not defined GSUDO_EXE if exist "%ProgramFiles%\gsudo\Current\gsudo.exe" set "GSUDO_EXE=%ProgramFiles%\gsudo\Current\gsudo.exe"
+
+if exist "%SCRIPT_DIR%PsExec64.exe" (
+    set "PSEXEC_EXE=%SCRIPT_DIR%PsExec64.exe"
+) else if exist "%SCRIPT_DIR%PsExec.exe" (
+    set "PSEXEC_EXE=%SCRIPT_DIR%PsExec.exe"
+) else if exist "%ProgramFiles%\Sysinternals\PsExec64.exe" (
+    set "PSEXEC_EXE=%ProgramFiles%\Sysinternals\PsExec64.exe"
+) else if exist "%ProgramFiles%\Sysinternals\PsExec.exe" (
+    set "PSEXEC_EXE=%ProgramFiles%\Sysinternals\PsExec.exe"
 )
 
-:: 3. Immediate Lockdown: Disable non-Microsoft scheduled tasks & terminate non-essential processes
+:: 3. Attempt higher privilege escalation FIRST (TrustedInstaller via gsudo, then SYSTEM via PsExec)
+set "ELEVATED_LAUNCHED=0"
+if defined GSUDO_EXE (
+    echo [PRIVILEGE] Attempting TrustedInstaller shell via gsudo --ti...
+    "%GSUDO_EXE%" --ti cmd /c "title %WIN_TITLE% & echo [TI-SHELL] Active"
+    if !errorlevel! equ 0 set "ELEVATED_LAUNCHED=1"
+)
+
+if "%ELEVATED_LAUNCHED%"=="0" if defined PSEXEC_EXE (
+    echo [PRIVILEGE] Attempting SYSTEM shell via PsExec...
+    "%PSEXEC_EXE%" -accepteula -s -i cmd.exe /c "title %WIN_TITLE% & echo [SYSTEM-SHELL] Active"
+    if !errorlevel! equ 0 set "ELEVATED_LAUNCHED=1"
+)
+
+:: 4. Disable non-Microsoft scheduled tasks (keeping Windows/Microsoft tasks intact)
 echo [LOCKDOWN] Disabling non-Microsoft scheduled tasks...
 powershell -NoProfile -Command ^
   "$tasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskPath -notlike '\Microsoft*' }; " ^
@@ -40,75 +52,45 @@ powershell -NoProfile -Command ^
   "  try { Disable-ScheduledTask -InputObject $t -ErrorAction SilentlyContinue | Out-Null } catch {} " ^
   "}"
 
-echo [LOCKDOWN] Terminating non-essential running processes...
+:: 5. Terminate unapproved processes while strictly protecting your 36 core Windows processes & active recovery tools
+echo [LOCKDOWN] Cleaning non-essential processes (Core Windows & Security processes protected)...
 powershell -NoProfile -Command ^
-  "$protected = @('System','Idle','Registry','smss','csrss','wininit','services','lsass','winlogon','svchost','dwm','fontdrvhost','conhost','cmd','powershell','pwsh','explorer','sihost','taskhostw','RuntimeBroker','SecurityHealthService','MsMpEng'); " ^
+  "$protected = @(" ^
+  "  'System', 'ntoskrnl', 'System Idle Process', 'Idle', 'smss', 'csrss', 'wininit', 'services', " ^
+  "  'lsass', 'lsaiso', 'svchost', 'fontdrvhost', 'dwm', 'winlogon', 'explorer', 'sihost', " ^
+  "  'taskhostw', 'ctfmon', 'StartMenuExperienceHost', 'ShellExperienceHost', 'SearchHost', 'SearchApp', " ^
+  "  'RuntimeBroker', 'ApplicationFrameHost', 'TextInputHost', 'MsMpEng', 'SecurityHealthService', " ^
+  "  'SecurityHealthSystray', 'NisSrv', 'audiodg', 'spoolsv', 'WmiPrvSE', 'dllhost', 'conhost', " ^
+  "  'dasHost', 'SearchIndexer', 'Registry', 'Memory Compression', " ^
+  "  'cmd', 'powershell', 'pwsh', 'gsudo', 'PsExec', 'PsExec64', 'sfc', 'DISM', 'mrt', 'MBSetup'" ^
+  "); " ^
   "$selfPid = $PID; " ^
   "$procs = Get-Process -ErrorAction SilentlyContinue | Where-Object { " ^
-  "  $_.Id -ne $selfPid -and " ^
-  "  ($_.ProcessName -notin $protected) -and " ^
-  "  ($_.Path -notlike ($env:SystemRoot + '\System32\*')) -and " ^
-  "  ($_.Path -notlike ($env:SystemRoot + '\SysWOW64\*')) " ^
+  "  $_.Id -ne $selfPid -and ($_.ProcessName -notin $protected) " ^
   "}; " ^
   "foreach ($p in $procs) { " ^
-  "  try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch {} " ^
+  "  try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; Write-Host ('[TERMINATED] ' + $p.ProcessName + ' (PID: ' + $p.Id + ')') } catch {} " ^
   "}"
 
-:: 4. Check if winget is available and active
-set "WINGET_READY=0"
-where winget >nul 2>&1
-if %errorlevel% equ 0 (
-    winget --info >nul 2>&1
-    if %errorlevel% equ 0 (
-        set "WINGET_READY=1"
-    )
-)
-
-:: 5. Check or install gsudo
-set "GSUDO_PATH="
-where gsudo >nul 2>&1
-if %errorlevel% equ 0 (
-    for /f "delims=" %%I in ('where gsudo 2^>nul') do (
-        if not defined GSUDO_PATH set "GSUDO_PATH=%%I"
-    )
-) else (
-    if "%WINGET_READY%"=="1" (
-        echo gsudo not found. Installing via winget...
-        winget install --id gerardog.gsudo -e --accept-source-agreements --accept-package-agreements
-        if exist "%ProgramFiles%\gsudo\Current\gsudo.exe" (
-            set "PATH=%ProgramFiles%\gsudo\Current;%PATH%"
-            set "GSUDO_PATH=%ProgramFiles%\gsudo\Current\gsudo.exe"
-        ) else (
-            where gsudo >nul 2>&1
-            if %errorlevel% equ 0 (
-                for /f "delims=" %%I in ('where gsudo 2^>nul') do (
-                    if not defined GSUDO_PATH set "GSUDO_PATH=%%I"
-                )
-            )
-        )
-    )
-)
-
-:: 6. Run SFC /scannow; if blocked or non-zero, run DISM RestoreHealth then retry SFC
+:: 6. Run SFC /scannow; if issues remain, run DISM RestoreHealth then retry SFC
 echo [REPAIR] Running SFC /scannow...
 sfc /scannow
-set "SFC_RC=%errorlevel%"
-if %SFC_RC% neq 0 (
-    echo [WARNING] SFC returned code %SFC_RC%. Running DISM RestoreHealth...
+if errorlevel 1 (
+    echo [REPAIR] SFC detected issues or was interrupted. Running DISM RestoreHealth...
     DISM /Online /Cleanup-Image /RestoreHealth
     echo [REPAIR] Re-running SFC /scannow after DISM...
     sfc /scannow
 )
 
-:: 7. Launch Microsoft Malicious Software Removal Tool (MRT)
-echo [MRT] Launching Microsoft Windows Malicious Software Removal Tool (mrt.exe)...
+:: 7. Launch Microsoft Windows Malicious Software Removal Tool (MRT)
 if exist "%SystemRoot%\System32\mrt.exe" (
+    echo [SCANNER] Launching Microsoft Windows Malicious Software Removal Tool (mrt.exe)...
     start "" "%SystemRoot%\System32\mrt.exe"
 ) else (
     echo [WARNING] mrt.exe not found in System32.
 )
 
-:: 8. Check or launch Malwarebytes installer (local first, then download fallback)
+:: 8. Launch local Malwarebytes installer if present, or download official installer
 set "MB_EXE=%SCRIPT_DIR%MBSetup.exe"
 if not exist "%MB_EXE%" set "MB_EXE=%USERPROFILE%\Downloads\MBSetup.exe"
 if exist "%MB_EXE%" (
@@ -116,65 +98,13 @@ if exist "%MB_EXE%" (
     start "" "%MB_EXE%"
 ) else (
     echo [SCANNER] Downloading Malwarebytes installer...
-    powershell -NoProfile -Command "try { Invoke-WebRequest -Uri 'https://data-cdn.mbamupdates.com/web/mb4-setup-consumer/MBSetup.exe' -OutFile '$env:TEMP\MBSetup.exe' -UseBasicParsing; Start-Process '$env:TEMP\MBSetup.exe' } catch { Write-Host 'Manual download required: https://www.malwarebytes.com/mwb-download' }"
+    powershell -NoProfile -Command "try { Invoke-WebRequest -Uri 'https://data-cdn.mbamupdates.com/web/mb4-setup-consumer/MBSetup.exe' -OutFile '$env:TEMP\MBSetup.exe' -UseBasicParsing; Start-Process '$env:TEMP\MBSetup.exe' } catch { Write-Host '[INFO] Manual download required: https://www.malwarebytes.com/mwb-download' }"
 )
 
-:: 9. Try launching TrustedInstaller shell via gsudo --ti
-if defined GSUDO_PATH (
-    echo Launching TrustedInstaller command line via gsudo --ti...
-    "%GSUDO_PATH%" --ti cmd /k "title %WIN_TITLE%"
-    if !errorlevel! equ 0 goto :end_script
-    echo [WARNING] gsudo --ti failed or was blocked. Trying PsExec fallback...
-)
-
-:: 10. Check or install PsExec
-set "PSEXEC_PATH="
-where psexec64 >nul 2>&1
-if %errorlevel% equ 0 (
-    for /f "delims=" %%I in ('where psexec64 2^>nul') do (
-        if not defined PSEXEC_PATH set "PSEXEC_PATH=%%I"
-    )
-)
-if not defined PSEXEC_PATH (
-    where psexec >nul 2>&1
-    if %errorlevel% equ 0 (
-        for /f "delims=" %%I in ('where psexec 2^>nul') do (
-            if not defined PSEXEC_PATH set "PSEXEC_PATH=%%I"
-        )
-    )
-)
-if not defined PSEXEC_PATH (
-    if "%WINGET_READY%"=="1" (
-        echo PsExec not found. Installing Microsoft Sysinternals PsExec via winget...
-        winget install --id Microsoft.Sysinternals.PsExec -e --accept-source-agreements --accept-package-agreements
-        if exist "%ProgramFiles%\Sysinternals\PsExec64.exe" (
-            set "PSEXEC_PATH=%ProgramFiles%\Sysinternals\PsExec64.exe"
-        ) else if exist "%ProgramFiles%\Sysinternals\PsExec.exe" (
-            set "PSEXEC_PATH=%ProgramFiles%\Sysinternals\PsExec.exe"
-        ) else (
-            where psexec >nul 2>&1
-            if %errorlevel% equ 0 (
-                for /f "delims=" %%I in ('where psexec 2^>nul') do (
-                    if not defined PSEXEC_PATH set "PSEXEC_PATH=%%I"
-                )
-            )
-        )
-    )
-)
-
-:: 11. Try launching system-level recovery command line via PsExec
-if defined PSEXEC_PATH (
-    echo Launching system-level recovery command line via PsExec...
-    "%PSEXEC_PATH%" -accepteula -s -i cmd.exe /k "title %WIN_TITLE%"
-    if !errorlevel! equ 0 goto :end_script
-    echo [WARNING] PsExec execution failed or was blocked.
-)
-
-:: 12. Final fallback: Show window that computer likely cannot be recovered
-echo [ERROR] Neither gsudo nor PsExec could launch a recovery shell.
-powershell -NoProfile -Command "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('The powerful privileges of the computer have been taken over by the virus. To run this software, you will now need to start Safe Mode with Networking. Start this image and run this file again.', 'Recovery Unavailable', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null"
-
-:end_script
-:: Re-enable Windows Defender Real-Time Monitoring before exit
-powershell -NoProfile -Command "try { Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue } catch {}"
+:: 9. Keep elevated recovery command prompt open for manual inspection if needed
+echo.
+echo ====================================================================
+echo [DONE] Recovery sequence finished. Protected core processes untouched.
+echo ====================================================================
+cmd /k "title %WIN_TITLE%"
 endlocal
